@@ -95,7 +95,8 @@ def tid_value(tids):
     else:
         return np.array([topic_dict.get(i) for i in tids.split(',')])
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cpu')
+#device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 #标题信息提取。不等长seq2one
@@ -180,6 +181,23 @@ class Inception(nn.Module):
         x = torch.cat((x1,x2,x3),dim=2).view(n,-1)
         return x #(batch_size*48)
 
+class FactorizationMachine(torch.nn.Module):
+
+    def __init__(self, reduce_sum=True):
+        super().__init__()
+        self.reduce_sum = reduce_sum
+
+    def forward(self, x):
+        """
+        :param x: Float tensor of size ``(batch_size, num_fields, embed_dim)``
+        """
+        square_of_sum = torch.sum(x, dim=1) ** 2
+        sum_of_square = torch.sum(x ** 2, dim=1)
+        ix = square_of_sum - sum_of_square
+        if self.reduce_sum:
+            ix = torch.sum(ix, dim=1, keepdim=True)
+        return 0.5 * ix
+    
 class mynet(nn.Module):
     def __init__(self,A_object_dims,Q_id_num,A_id_num,device):
         super(mynet,self).__init__()
@@ -195,12 +213,15 @@ class mynet(nn.Module):
         
         self.em_Qid = nn.Embedding(Q_id_num,8)
         self.em_Aid = nn.Embedding(A_id_num,8)
-        
-        self.out = nn.Sequential(nn.Linear(64,32),
+        self.FM = FactorizationMachine()
+        self.out = nn.Sequential(nn.Linear(48,32),
                                  nn.PReLU(),
                                  nn.Linear(32,16),
                                  nn.PReLU(),
                                  nn.Linear(16,1))
+        torch.nn.init.xavier_uniform_(self.em_A.weight.data)
+        torch.nn.init.xavier_uniform_(self.em_Aid.weight.data)
+        torch.nn.init.xavier_uniform_(self.em_Qid.weight.data)
         self.device = device
     def forward(self,Q_A_pair):
         batch_size = len(Q_A_pair)
@@ -215,18 +236,23 @@ class mynet(nn.Module):
         #A num(batch*11); 
         A_num,A_object = get_A_info(Q_A_pair,self.device)
         A_num = self.A_num_BN(A_num)
-        A_object = self.em_A(A_object).reshape(batch_size,-1) #(batch*(12*em_A))
+        A_object2 = self.em_A(A_object) #FM用
+        A_object = A_object2.reshape(batch_size,-1) #(batch*(12*em_A))
         A_object = self.em_A_dense(A_object)
         A_feature = torch.cat((A_num,A_object),dim=1)
         #Q_topic,Q_title,A_info
-        combined = torch.stack((title_w_out,A_feature,title_t_out),dim=1).unsqueeze(1) #(batch*1*3*64)
-        combined = self.conv(combined)
+        combined1 = torch.stack((title_w_out,A_feature,title_t_out),dim=1).unsqueeze(1) #(batch*1*3*64)
+        combined1 = self.conv(combined1)
+        out1 = self.out(combined1)
+        
         #Q_id & A_id
-        Q_id = self.em_Qid(torch.tensor(Q_A_pair.Q_LE.values,dtype=torch.long,device=self.device)) #(batch*8)
-        A_id = self.em_Aid(torch.tensor(Q_A_pair.A_LE.values,dtype=torch.long,device=self.device)) #(batch*8)
+        Q_id = self.em_Qid(torch.tensor(Q_A_pair.Q_LE.values,dtype=torch.long,device=self.device)).unsqueeze(1) #(batch*1*8)
+        A_id = self.em_Aid(torch.tensor(Q_A_pair.A_LE.values,dtype=torch.long,device=self.device)).unsqueeze(1) #(batch*1*8)
+        combined2 = torch.cat((Q_id,A_id,A_object2),dim=1)
+        out2 = self.FM(combined2)
         #Total
-        total = torch.cat((combined,Q_id,A_id),dim=1)
-        return self.out(total)
+        
+        return out1+out2/2
 
 def AUC(y,y_hat):
     '''
@@ -295,6 +321,7 @@ def train(train_X,train_y,test_X,test_y,net,loss,batch_size,epoch,lr):
             j += 1
         print('Epoch:%d, Train Loss:%f'%(i,np.mean(train_li)),flush=True)
         train_l.append(np.mean(train_li))
+        torch.save(net.state_dict(),'%s/%snet.pt'%(PATH,str(i)))
         if test_y is not None:
             test_li = []
             auc = []
@@ -305,8 +332,7 @@ def train(train_X,train_y,test_X,test_y,net,loss,batch_size,epoch,lr):
                 auci = AUC(y,y_hat)
                 test_li.append(li)
                 auc.append(auci)
-            print('Epoch:%d, Valid Loss:%f, AUC: '%(i,np.mean(test_li),np.mean(auc)),flush=True)
-        torch.save(net.state_dict(),'%s/%snet.pt'%(PATH,str(i)))
+            print('Epoch:%d, Valid Loss:%f, AUC:%f '%(i,np.mean(test_li),np.mean(auc)),flush=True)
         print('Epoch:%d, Time used:%.4f'%(i,time.time()-time_1),flush=True)
         test_l.append(np.mean(test_li))
     return train_l,test_l
