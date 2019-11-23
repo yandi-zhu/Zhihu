@@ -144,8 +144,8 @@ def pad_output(pped,idx):
 
 
 A_object_feature = ['gender', 'freq', 'A1', 'B1', 'C1', 'D1', 'E1', 'A2', 'B2', 'C2', 'D2','E2']
-A_num_feature = ['score','excellent','recommend', 'round_table', 'figure', 'video', 'num_word', 'num_like',
-                'num_unlike', 'num_comment', 'num_favor', 'num_thank', 'num_report',
+#去掉一些定量变量'excellent','recommend', 'round_table', 'figure', 'video', 
+A_num_feature = ['score','num_word', 'num_like','num_unlike', 'num_comment', 'num_favor', 'num_thank', 'num_report',
                 'num_nohelp', 'num_oppose', 'answer_num']
 A_topic_feature = ['topic_attent', 'topic_interest']
 
@@ -180,33 +180,37 @@ def get_A_info(Q_A_pair,device):
 
 
 # In[31]:
-
+class Inception(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels=1,out_channels=8,kernel_size=(1,64),stride=1)
+        self.conv2 = nn.Conv2d(in_channels=1,out_channels=8,kernel_size=(2,64),stride=1)
+        self.conv3 = nn.Conv2d(in_channels=1,out_channels=8,kernel_size=(3,64),stride=1)
+    def forward(self,x):
+        n = x.shape[0]
+        x1 = self.conv1(x).squeeze(3)
+        x2 = self.conv2(x).squeeze(3)
+        x3 = self.conv3(x).squeeze(3)
+        x = torch.cat((x1,x2,x3),dim=2).view(n,-1)
+        return x #(batch_size*48)
 
 class mynet(nn.Module):
     def __init__(self,A_object_dims,device):
         super(mynet,self).__init__()
-        self.rnn_title_w = nn.LSTM(64,64,3,batch_first=True,bidirectional=True)
-        self.title_w_dense = nn.Sequential(nn.Linear(128,64),
-                                           nn.PReLU(),
-                                           nn.BatchNorm1d(64),
-                                           nn.Linear(64,16),
-                                           nn.PReLU())
+        self.rnn_title_w = nn.LSTM(64,64,3,batch_first=True)
         self.rnn_title_t = nn.LSTM(64,64,1,batch_first=True)
-        self.title_t_dense = nn.Sequential(nn.Linear(64,16),
-                                           nn.PReLU())
         self.em_A = nn.Embedding(A_object_dims,8)
-        self.em_A_dense = nn.Sequential(nn.Linear(12*8,32),
-                                        nn.PReLU(),
-                                        nn.BatchNorm1d(32),
-                                        nn.Linear(32,16),
-                                        nn.PReLU())
-        self.A_num_BN = nn.BatchNorm1d(16)
-        self.out = nn.Sequential(nn.Linear(16+16+16+16,64),
+        self.em_A_dense = nn.Sequential(nn.Linear(12*8,64)
+                                       nn.PReLU(),
+                                       nn.Linear(64,53)
+                                       nn.PReLU())
+        self.A_num_BN = nn.BatchNorm1d(11)
+        self.conv = Inception()
+        self.out = nn.Sequential(nn.Linear(48,32),
                                  nn.PReLU(),
-                                 nn.BatchNorm1d(64),
-                                 nn.Linear(64,32),
+                                 nn.Linear(32,16),
                                  nn.PReLU(),
-                                 nn.Linear(32,1))
+                                 nn.Linear(16,1))
         #self.em_Qid = nn.Embedding(QA_dims,8)
         #self.em_Aid = nn.Embedding(QA_dims,8)
         self.device = device
@@ -215,22 +219,22 @@ class mynet(nn.Module):
         #Q title word
         title_w,title_w_idx = get_Q_info(Q_A_pair,'title_w_series',self.device)
         title_w_out,_ = self.rnn_title_w(title_w)
-        title_w_out = pad_output(title_w_out,title_w_idx) #(batch*LSTM(hid)*2)
-        title_w_out = self.title_w_dense(title_w_out)
+        title_w_out = pad_output(title_w_out,title_w_idx) #(batch*LSTM(hid))
         #Q topic
         title_t,title_t_idx = get_Q_info(Q_A_pair,'topic',self.device)
         title_t_out,_ = self.rnn_title_t(title_t)
-        title_t_out = pad_output(title_t_out,title_t_idx) #(batch*LSTM(hid)*2)
-        title_t_out = self.title_t_dense(title_t_out)
-        #A num(batch*16); 
+        title_t_out = pad_output(title_t_out,title_t_idx) #(batch*LSTM(hid))
+        #A num(batch*11); 
         A_num,A_object = get_A_info(Q_A_pair,self.device)
         A_num = self.A_num_BN(A_num)
         A_object = self.em_A(A_object).reshape(batch_size,-1) #(batch*(12*em_A))
         A_object = self.em_A_dense(A_object)
+        A_feature = torch.cat((A_num,A_object),dim=1)
         
-        combined = torch.cat((title_w_out,title_t_out,A_object,A_num),dim=1)
-        
-        return self.out(combined) 
+        combined = torch.stack((title_w_out,A_feature,title_t_out),dim=1).unsqueeze(1) #(batch*1*3*64)
+        combined = self.conv(combined)
+
+        return self.out(combined)
 
 
 # In[32]:
@@ -244,7 +248,7 @@ net.to(device)
 
 
 batch_size = 1024
-lr = 0.001
+lr = 0.01
 epoch = 10
 loss = nn.BCEWithLogitsLoss()
 
