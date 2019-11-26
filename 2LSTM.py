@@ -15,6 +15,9 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.nn.utils.rnn import pad_packed_sequence
 from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import scale
+from tqdm import tqdm
+import random
 print('Start!',flush=True)
 def sizemb(data):
     return sys.getsizeof(data)/1024**2
@@ -68,8 +71,11 @@ A_info.drop(columns=['keyword', 'grade', 'hotness', 'reg_type','reg_plat'],inpla
 
 A_info.topic_interest = A_info.topic_interest.apply(parse_map)
 
+
 with open('./author_count.pkl', 'rb') as file:
     author_count = pickle.load(file)
+with open('./Q_A_pair_hist.pkl', 'rb') as file:
+    Q_A_pair_hist = pickle.load(file)
 
 A_info = A_info.merge(author_count,how='left',left_on='author_id',right_index=True)
 
@@ -79,6 +85,10 @@ A_info.set_index('author_id',inplace=True,drop='True')
 
 del author_count
 gc.collect()
+
+Q_A_pair_hist['label'] = np.ones(len(Q_A_pair_hist))
+Q_A_pair_hist.columns = Q_A_pair.columns
+Q_A_pair = pd.concat([Q_A_pair,Q_A_pair_hist],axis=0,ignore_index=True)
 
 def wid_value(wids):
     #根据词的id list 返回 对应词embedding list
@@ -94,9 +104,6 @@ def tid_value(tids):
         return [[0]*64]
     else:
         return np.array([topic_dict.get(i) for i in tids.split(',')])
-
-device = torch.device('cpu')
-#device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 #标题信息提取。不等长seq2one
@@ -158,6 +165,20 @@ Q_A_pair_eval['A_LE'] = A_LE[len(Q_A_pair):]
 Q_id_num = len(LE_Q.classes_)
 A_id_num = len(LE_A.classes_)
 
+#Count_embedding
+Q_CE = pd.concat([Q_A_pair.question_id,Q_A_pair_eval.question_id]).value_counts().astype(float)
+# Q_min,Q_max = Q_CE.min(),Q_CE.max()
+# Q_CE = Q_CE.map(lambda x: (x-Q_min)/(Q_max-Q_min))
+Q_A_pair['Q_CE'] = scale(Q_A_pair.question_id.map(Q_CE))
+Q_A_pair_eval['Q_CE'] = scale(Q_A_pair_eval.question_id.map(Q_CE))
+
+A_CE = pd.concat([Q_A_pair.author_id,Q_A_pair_eval.author_id]).value_counts().astype(float)
+# A_min,A_max = A_CE.min(),A_CE.max()
+# A_CE = A_CE.map(lambda x: (x-A_min)/(A_max-A_min))
+Q_A_pair['A_CE'] = scale(Q_A_pair.author_id.map(A_CE))
+Q_A_pair_eval['A_CE'] = scale(Q_A_pair_eval.author_id.map(A_CE))
+
+
 def get_A_info(Q_A_pair,device):
     #input batch Q_A_pair
     #return batch A_num/A_object
@@ -186,6 +207,7 @@ class FactorizationMachine(torch.nn.Module):
     def __init__(self, reduce_sum=True):
         super().__init__()
         self.reduce_sum = reduce_sum
+        self.linear = nn.Linear(14*8,1)
 
     def forward(self, x):
         """
@@ -196,7 +218,7 @@ class FactorizationMachine(torch.nn.Module):
         ix = square_of_sum - sum_of_square
         if self.reduce_sum:
             ix = torch.sum(ix, dim=1, keepdim=True)
-        return 0.5 * ix
+        return 0.5 * ix + self.linear(x.view(x.shape[0],-1))
     
 class mynet(nn.Module):
     def __init__(self,A_object_dims,Q_id_num,A_id_num,device):
@@ -214,7 +236,7 @@ class mynet(nn.Module):
         self.em_Qid = nn.Embedding(Q_id_num,8)
         self.em_Aid = nn.Embedding(A_id_num,8)
         self.FM = FactorizationMachine()
-        self.out = nn.Sequential(nn.Linear(48,32),
+        self.out = nn.Sequential(nn.Linear(50,32),
                                  nn.PReLU(),
                                  nn.Linear(32,16),
                                  nn.PReLU(),
@@ -243,16 +265,18 @@ class mynet(nn.Module):
         #Q_topic,Q_title,A_info
         combined1 = torch.stack((title_w_out,A_feature,title_t_out),dim=1).unsqueeze(1) #(batch*1*3*64)
         combined1 = self.conv(combined1)
-        out1 = self.out(combined1)
+        #CountEmbedding Feature
+        CE_Feature = torch.tensor(Q_A_pair[['Q_CE','A_CE']].values,dtype=torch.float,device=device)
+        out1 = self.out(torch.cat((combined1,CE_Feature),dim=1))
         
         #Q_id & A_id
         Q_id = self.em_Qid(torch.tensor(Q_A_pair.Q_LE.values,dtype=torch.long,device=self.device)).unsqueeze(1) #(batch*1*8)
         A_id = self.em_Aid(torch.tensor(Q_A_pair.A_LE.values,dtype=torch.long,device=self.device)).unsqueeze(1) #(batch*1*8)
-        combined2 = torch.cat((Q_id,A_id,A_object2),dim=1)
+        combined2 = torch.cat((Q_id,A_id,A_object2),dim=1) #(batch*14*8)
         out2 = self.FM(combined2)
         #Total
         
-        return out1+out2/2
+        return (out1+out2)/2
 
 def AUC(y,y_hat):
     '''
@@ -264,19 +288,21 @@ def AUC(y,y_hat):
         y_true = y.cpu().numpy()
     return roc_auc_score(y_true,y_hat)
 
+#device = torch.device('cpu')
+device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
 net = mynet(int(sum(A_object_dims)),Q_id_num,A_id_num,device)
 net.to(device)
 
 
-batch_size = 1024
+batch_size = 2048
 lr = 0.01
-epoch = 10
+epoch = 5
 loss = nn.BCEWithLogitsLoss()
 
 
 from sklearn.model_selection import ShuffleSplit
 
-SSplit = ShuffleSplit(n_splits=1,train_size=0.8,test_size=0.2)
+SSplit = ShuffleSplit(n_splits=1,train_size=0.9,test_size=0.1)
 
 #划分训练集和测试集
 for train_idx,test_idx in SSplit.split(Q_A_pair):
@@ -302,7 +328,8 @@ def generate_data(train_X,train_y,batch_size):
 
 def train(train_X,train_y,test_X,test_y,net,loss,batch_size,epoch,lr):
     train_l,test_l = [],[]
-    optimizer = optim.Adam(net.parameters(),lr,weight_decay=0)
+    optimizer = optim.Adam(net.parameters(),lr,weight_decay=0.001)
+    test_n = len(test_X)
     for i in range(epoch):
         time_1 = time.time()
         train_li = []
@@ -311,13 +338,19 @@ def train(train_X,train_y,test_X,test_y,net,loss,batch_size,epoch,lr):
         for X,y in generate_data(train_X,train_y,batch_size):
             optimizer.zero_grad()
             y_hat = net(X)
-            l = loss(y_hat.view(-1),y)  
-            l.backward()
+            l = loss(y_hat.view(-1),y)  #调整了顺序 11.25
             train_li.append(l.cpu().item())
-            optimizer.step()
             if(j%100==0):
                 print('Check:%d, Train Loss:%f'%(j//100,np.mean(train_li)),flush=True)
                 print('AUC:%f'% AUC(y,y_hat))
+                with torch.no_grad(): #check add test; sample 2048 11.26#
+                    idx = random.sample(range(test_n),2048)
+                    X_sample = test_X.iloc[idx,:]
+                    y_sample = torch.tensor(test_y.iloc[idx,:].values,dtype=torch.float,device=device)
+                    y_hat = net(X_sample)
+                    print('Test AUC:%f' %AUC(y_sample,y_hat))
+            l.backward()
+            optimizer.step()
             j += 1
         print('Epoch:%d, Train Loss:%f'%(i,np.mean(train_li)),flush=True)
         train_l.append(np.mean(train_li))
@@ -334,9 +367,9 @@ def train(train_X,train_y,test_X,test_y,net,loss,batch_size,epoch,lr):
                 auc.append(auci)
             print('Epoch:%d, Valid Loss:%f, AUC:%f '%(i,np.mean(test_li),np.mean(auc)),flush=True)
         print('Epoch:%d, Time used:%.4f'%(i,time.time()-time_1),flush=True)
-        test_l.append(np.mean(test_li))
+        #test_l.append(np.mean(test_li))
     return train_l,test_l
 
-PATH = '../model2'
+PATH = '../model4'
 train_l,test_l = train(train_X,train_y,test_X,test_y,net,loss,batch_size,epoch,lr)
 
